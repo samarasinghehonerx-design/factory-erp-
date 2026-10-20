@@ -197,11 +197,11 @@
     <form onsubmit="handleLogin(event)">
       <div class="form-group">
         <label>Username / පරිශීලක නාමය:</label>
-        <input type="text" id="login-username" class="form-control" required placeholder="admin or employee">
+        <input type="text" id="login-username" class="form-control" required placeholder="username or e-mail" autocomplete="username">
       </div>
       <div class="form-group">
         <label>Password / මුරපදය:</label>
-        <input type="password" id="login-password" class="form-control" required placeholder="••••••••">
+        <input type="password" id="login-password" class="form-control" required placeholder="••••••••" autocomplete="current-password">
       </div>
       <div id="login-error" style="color: var(--danger); font-size: 0.8rem; margin-bottom: 10px; display: none; text-align: center;">
         නොදන්නා පරිශීලක නාමයක් හෝ මුරපදයකි!
@@ -1639,7 +1639,7 @@
       <div class="data-card">
         <h3><i class="fa-solid fa-user-lock"></i> User-wise Permissions (per login)</h3>
         <p style="color:var(--text-muted); margin-bottom:12px;">
-          Give one specific <strong>Employee</strong> login its own pages and actions. Pick a login, tick <em>Use custom permissions for this login</em>, choose what that person may use, then save. Logins without custom permissions keep following the <strong>Roles &amp; Permissions</strong> panel above. Admin accounts always have full access, and Settings, Switch Role, Backup, Restore and Reset always stay Admin-only. The permissions apply the next time that person logs in.
+          Give one specific <strong>Employee</strong> login its own pages and actions. Pick a login, tick <em>Use custom permissions for this login</em>, choose what that person may use, then save. Logins without custom permissions keep following the <strong>Roles &amp; Permissions</strong> panel above. Admin accounts always have full access, and Settings, Switch Role, Backup, Restore and Reset always stay Admin-only. Saved changes reach that person's device within a few seconds.
         </p>
         <div class="form-group" style="max-width:380px;">
           <label>Select Login (Employee accounts):</label>
@@ -1723,7 +1723,8 @@
       </div>
       <div class="form-group">
         <label>Password:</label>
-        <input type="text" id="ua-password" class="form-control" required placeholder="Login password">
+        <input type="password" id="ua-password" class="form-control" required placeholder="Login password (min 6 characters)" autocomplete="new-password">
+        <small id="ua-password-hint" style="color:var(--text-muted); display:block; margin-top:4px;">Passwords are stored only by Firebase (never visible to anyone, including Admin). Username: 3-30 letters/numbers/. _ - — or a real e-mail address (then a password-reset e-mail can be sent).</small>
       </div>
       <div class="form-group">
         <label>Role:</label>
@@ -1740,6 +1741,30 @@
       <div style="display: flex; gap: 10px; border-top: 1px solid var(--border); padding-top: 12px;">
         <button type="button" class="btn-action btn-danger" style="flex: 1;" onclick="closeUserAccountModal()">Cancel</button>
         <button type="submit" class="btn-action btn-success" style="flex: 2;"><i class="fa-solid fa-floppy-disk"></i> Save User</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- NEW: Admin password confirmation (shown before sensitive Settings changes) -->
+<div class="modal-overlay" id="reauth-modal">
+  <div class="modal-container" style="max-width: 400px;">
+    <div class="modal-header">
+      <h3><i class="fa-solid fa-shield-halved"></i> Confirm Admin Password</h3>
+      <button type="button" class="btn-action btn-danger" style="padding: 2px 8px;" onclick="cancelReauth()">✕</button>
+    </div>
+    <form onsubmit="submitReauth(event)">
+      <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 10px;">
+        ආරක්ෂාව සඳහා, ගිණුම්/අවසර වෙනස් කිරීමට පෙර ඔබගේ Admin මුරපදය නැවත ඇතුළත් කරන්න. (Re-enter your Admin password to continue.)
+      </p>
+      <div class="form-group">
+        <label>Your Admin password:</label>
+        <input type="password" id="reauth-password" class="form-control" required autocomplete="current-password">
+      </div>
+      <div id="reauth-error" style="color: var(--danger); font-size: 0.8rem; margin-bottom: 8px; display: none;"></div>
+      <div style="display: flex; gap: 10px; border-top: 1px solid var(--border); padding-top: 12px;">
+        <button type="button" class="btn-action btn-danger" style="flex: 1;" onclick="cancelReauth()">Cancel</button>
+        <button type="submit" class="btn-action btn-success" style="flex: 2;"><i class="fa-solid fa-check"></i> Confirm</button>
       </div>
     </form>
   </div>
@@ -3130,42 +3155,275 @@
 </div>
 
 <script>
-  // Auth & Role Credentials Engine
-  const USER_CREDENTIALS = {
-    'admin': { password: 'anupa@123', role: 'Admin' },
-    // ADDITIVE: shared login for Sales Reps out on route visits. Landing
-    // page/role is entirely separate from Admin/Employee (see handleLogin) —
-    // this does not change the 'admin' entry or existing login behavior.
-    'salesrep': { password: 'rep@123', role: 'SalesRep' }
-  };
+  // =====================================================================
+  // SECURE LOGIN — Firebase Authentication + Firestore
+  // ---------------------------------------------------------------------
+  // Replaces the old browser-side password check. There are NO passwords in
+  // this file or in any data any more:
+  //   • Passwords live only inside Firebase Authentication (hashed by Google).
+  //   • Who may log in, and with which role, is decided by a per-person
+  //     document  staff/{uid}  that ONLY an Admin can create or change
+  //     (enforced by the Firestore rules in firestore.rules, not by this page).
+  //   • Role-wide settings (Roles & Permissions, Security) live in
+  //     config/access (read: any active staff, write: Admin only).
+  //   • Cloud data sync starts only AFTER a successful login.
+  // The ERP screens, features and permission matrices are unchanged.
+  // =====================================================================
+  // A login name without "@" is turned into an e-mail address with this
+  // reserved (non-deliverable) domain; a name that already contains "@" is
+  // used as the real e-mail address.
+  const LOGIN_EMAIL_DOMAIN = 'erp.example.com';
+  // These parts of `state` belong to THIS device/session or to the
+  // Firestore staff/config documents — they are never written into (or read
+  // from) the shared business-data document.
+  const LOCAL_ONLY_STATE_KEYS = ['users', 'rolePermissions', 'security', 'loginActivity', 'role', 'currentUsername'];
 
-  // BUGFIX/NEW: login now checks state.users (managed from Settings > User
-  // Accounts) instead of only the hardcoded USER_CREDENTIALS object, so
-  // accounts Admin adds, edits, deactivates, or changes the password of
-  // from Settings actually take effect. USER_CREDENTIALS itself is kept
-  // only as the seed data for defaultState.users above — the default
-  // admin/salesrep logins keep working exactly as before.
-  function handleLogin(e) {
+  let authSession = null;          // { uid, username, role } while logged in
+  let loginBusy = false;
+  let pendingLogoutPromise = null;
+  let staffUnsub = null, accessUnsub = null, loginLogUnsub = null;
+  let cloudDocUnsub = null;        // unsubscribe handle for the shared-state listener
+  let cloudLoginLog = [];          // Admin only: recent successful logins from Firestore
+  let accessConfigLoaded = false;
+  let lastAccessConfigJson = '';
+  let adminReauthAt = 0;
+  let reauthResolver = null;
+
+  function toLoginEmail(username) {
+    const u = String(username || '').trim().toLowerCase();
+    return u.indexOf('@') >= 0 ? u : (u + '@' + LOGIN_EMAIL_DOMAIN);
+  }
+
+  function isValidLoginName(n) {
+    n = String(n || '');
+    return /^[a-z0-9._-]{3,30}$/.test(n) || /^[a-z0-9._%+-]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(n);
+  }
+
+  function secureInit() {
+    if (!cloudSyncConfigured) throw new Error('not-configured');
+    if (typeof firebase === 'undefined') throw new Error('sdk-missing');
+    if (!firebase.apps.length) firebase.initializeApp(CLOUD_SYNC_CONFIG);
+    if (!cloudDb) cloudDb = firebase.firestore();
+    return { auth: firebase.auth(), db: cloudDb };
+  }
+
+  function loginErrorMessage(err) {
+    const c = (err && err.code) || '';
+    if (c === 'auth/too-many-requests') return 'වැරදි උත්සාහයන් ඉතා වැඩියි. මොහොතකින් නැවත උත්සාහ කරන්න. (Too many attempts — try again later.)';
+    if (c === 'auth/network-request-failed') return 'Internet connection එකක් නැත. (No internet connection.)';
+    if (c === 'auth/user-disabled') return 'මෙම ගිණුම අක්‍රීය කර ඇත. (Account disabled.)';
+    if (c === 'auth/operation-not-allowed') return 'Firebase Console > Authentication > Sign-in method හි Email/Password සක්‍රීය කර නැත.';
+    return 'නොදන්නා පරිශීලක නාමයක් හෝ මුරපදයකි!';
+  }
+
+  function friendlyFirebaseError(err) {
+    const c = (err && err.code) || '';
+    if (c === 'auth/email-already-in-use') return 'That username already has a login in Firebase Authentication. If it was removed from this list earlier, delete it in Firebase Console > Authentication > Users first, or choose a different username.';
+    if (c === 'auth/weak-password') return 'Password is too weak (minimum 6 characters).';
+    if (c === 'auth/invalid-email') return 'Invalid username / e-mail format.';
+    if (c === 'auth/network-request-failed') return 'No internet connection. Please try again.';
+    if (c === 'auth/operation-not-allowed') return 'Email/Password sign-in is not enabled in Firebase Console > Authentication > Sign-in method.';
+    if (c === 'permission-denied') return 'The server refused this action (Firestore rules). Make sure you are logged in as an active Admin.';
+    return 'Operation failed: ' + ((err && err.message) || c || 'unknown error');
+  }
+
+  function captureLocalOnlyFields() {
+    const o = {};
+    LOCAL_ONLY_STATE_KEYS.forEach(k => { if (state && state[k] !== undefined) o[k] = state[k]; });
+    return o;
+  }
+  function restoreLocalOnlyFields(o) {
+    LOCAL_ONLY_STATE_KEYS.forEach(k => {
+      if (Object.prototype.hasOwnProperty.call(o, k)) state[k] = o[k];
+      else delete state[k];
+    });
+  }
+
+  function accessConfigPayload() {
+    return {
+      rolePermissions: JSON.parse(JSON.stringify(state.rolePermissions || { employeeExtraTabs: [], employeeActions: {} })),
+      security: JSON.parse(JSON.stringify(state.security || { autoLogoutMinutes: 0, minPasswordLength: 4 }))
+    };
+  }
+
+  function applyAccessConfig(data) {
+    if (!data || typeof data !== 'object') return;
+    const rp = data.rolePermissions;
+    if (rp && typeof rp === 'object') {
+      state.rolePermissions = {
+        employeeExtraTabs: Array.isArray(rp.employeeExtraTabs) ? rp.employeeExtraTabs.filter(x => typeof x === 'string') : [],
+        employeeActions: (rp.employeeActions && typeof rp.employeeActions === 'object' && !Array.isArray(rp.employeeActions)) ? rp.employeeActions : {}
+      };
+    }
+    const sc = data.security;
+    if (sc && typeof sc === 'object') {
+      state.security = {
+        autoLogoutMinutes: Math.max(0, Number(sc.autoLogoutMinutes) || 0),
+        minPasswordLength: Math.max(1, Number(sc.minPasswordLength) || 4)
+      };
+    }
+  }
+
+  async function loadAccessConfig(db, role, username) {
+    accessConfigLoaded = false;
+    try {
+      const ref = db.collection('config').doc('access');
+      const snap = await ref.get();
+      if (snap.exists) {
+        applyAccessConfig(snap.data());
+        accessConfigLoaded = true;
+      } else if (role === 'Admin') {
+        // First Admin login ever: publish the current role settings.
+        await ref.set(Object.assign({ updatedAt: new Date().toISOString(), updatedBy: username }, accessConfigPayload()));
+        accessConfigLoaded = true;
+      }
+      if (accessConfigLoaded) lastAccessConfigJson = JSON.stringify(accessConfigPayload());
+    } catch (err) { /* keep local defaults; Admin can retry by saving again */ }
+  }
+
+  // Called from saveState(): when Admin changes Roles & Permissions or
+  // Security settings, publish them to config/access for every device.
+  function pushAccessConfigIfChanged() {
+    if (!authSession || authSession.role !== 'Admin' || !cloudDb || !accessConfigLoaded) return;
+    const payload = accessConfigPayload();
+    const json = JSON.stringify(payload);
+    if (json === lastAccessConfigJson) return;
+    lastAccessConfigJson = json;
+    cloudDb.collection('config').doc('access')
+      .set(Object.assign({ updatedAt: new Date().toISOString(), updatedBy: authSession.username }, payload))
+      .catch(() => { lastAccessConfigJson = ''; setCloudStatus('Cloud Sync: permission settings not saved (retry)', 'error'); });
+  }
+
+  function normalizeStaffDoc(uid, data) {
+    const u = {
+      uid: uid,
+      username: String((data && data.username) || ''),
+      role: (data && data.role) || 'Employee',
+      active: !(data && data.active === false),
+      lastLogin: (data && data.lastLogin) || null
+    };
+    if (data && data.permissions !== undefined) u.permissions = data.permissions;
+    return u;
+  }
+
+  function refreshAfterStaffChange() {
+    try { localStorage.setItem('FACTORY_ERP_STATE', JSON.stringify(state)); } catch (e) {}
+    const main = document.getElementById('main-app');
+    if (!main || main.style.display === 'none') return;
+    if (authSession && authSession.role === 'Employee' && state.role === 'Employee') {
+      applyExtraEmployeePermissions();
+      applyActionPermissionsToDOM();
+    }
+    renderSettings();
+  }
+
+  function stopSessionListeners() {
+    [staffUnsub, accessUnsub, loginLogUnsub].forEach(fn => { if (typeof fn === 'function') { try { fn(); } catch (e) {} } });
+    staffUnsub = accessUnsub = loginLogUnsub = null;
+  }
+
+  function startSessionListeners(db, uid, role) {
+    stopSessionListeners();
+    if (role === 'Admin') {
+      staffUnsub = db.collection('staff').onSnapshot(snap => {
+        const me = snap.docs.find(d => d.id === uid);
+        if (authSession && (!me || me.data().active === false || me.data().role !== 'Admin')) {
+          alert('Your Admin access has changed. Please log in again.');
+          logout();
+          return;
+        }
+        state.users = snap.docs.map(d => normalizeStaffDoc(d.id, d.data()));
+        refreshAfterStaffChange();
+      }, () => {});
+      loginLogUnsub = db.collection('login_log').orderBy('time', 'desc').limit(50).onSnapshot(snap => {
+        cloudLoginLog = snap.docs.map(d => d.data());
+        refreshAfterStaffChange();
+      }, () => {});
+    } else {
+      staffUnsub = db.collection('staff').doc(uid).onSnapshot(snap => {
+        const data = snap.exists ? snap.data() : null;
+        if (authSession && (!data || data.active === false || data.role !== role)) {
+          alert('Your account access has changed. Please log in again.');
+          logout();
+          return;
+        }
+        if (data) {
+          state.users = [normalizeStaffDoc(uid, data)];
+          refreshAfterStaffChange();
+        }
+      }, () => {});
+    }
+    accessUnsub = db.collection('config').doc('access').onSnapshot(snap => {
+      if (!snap.exists || snap.metadata.hasPendingWrites) return;
+      applyAccessConfig(snap.data());
+      lastAccessConfigJson = JSON.stringify(accessConfigPayload());
+      refreshAfterStaffChange();
+    }, () => {});
+  }
+
+  async function handleLogin(e) {
     e.preventDefault();
-    const user = document.getElementById('login-username').value.trim().toLowerCase();
-    const pass = document.getElementById('login-password').value.trim();
+    if (loginBusy) return;
+    loginBusy = true;
+    const submitBtn = (e.target && e.target.querySelector) ? e.target.querySelector('button[type="submit"]') : null;
+    if (submitBtn) submitBtn.disabled = true;
     const errDiv = document.getElementById('login-error');
-
-    const matchedUser = (state.users || []).find(u => u.username.toLowerCase() === user && u.password === pass);
-
-    if (matchedUser && matchedUser.active !== false) {
+    const showErr = msg => { errDiv.textContent = msg; errDiv.style.display = 'block'; };
+    try {
       errDiv.style.display = 'none';
-      state.role = matchedUser.role;
-      state.currentUsername = matchedUser.username; // NEW: who's currently logged in (used by Change Password & the activity log)
-      matchedUser.lastLogin = new Date().toISOString();
-      recordLoginActivity(matchedUser.username, matchedUser.role, true);
-      startAutoLogoutWatch(); // NEW
+      if (pendingLogoutPromise) { try { await pendingLogoutPromise; } catch (x) {} }
+
+      const userRaw = document.getElementById('login-username').value.trim().toLowerCase();
+      const pass = document.getElementById('login-password').value;
+      if (!userRaw || !pass) { showErr('නොදන්නා පරිශීලක නාමයක් හෝ මුරපදයකි!'); return; }
+
+      let fb;
+      try { fb = secureInit(); }
+      catch (err) { showErr('Secure login is unavailable (cloud login not configured, or Firebase failed to load). Check the internet connection and reload the page.'); return; }
+      try { await fb.auth.setPersistence(firebase.auth.Auth.Persistence.SESSION); } catch (x) {}
+
+      let cred;
+      try { cred = await fb.auth.signInWithEmailAndPassword(toLoginEmail(userRaw), pass); }
+      catch (err) {
+        recordLoginActivity(userRaw, null, false);
+        showErr(loginErrorMessage(err));
+        return;
+      }
+      const uid = cred.user.uid;
+
+      let staff = null;
+      try {
+        const snap = await fb.db.collection('staff').doc(uid).get();
+        staff = snap.exists ? snap.data() : null;
+      } catch (err) { staff = null; }
+
+      if (!staff || staff.active === false || ['Admin', 'Employee', 'SalesRep'].indexOf(staff.role) < 0) {
+        try { await fb.auth.signOut(); } catch (x) {}
+        recordLoginActivity(userRaw, staff ? staff.role : null, false);
+        showErr('මෙම ගිණුමට ප්‍රවේශය නැත හෝ අක්‍රීය කර ඇත. Admin අමතන්න. (Not authorised / deactivated.)');
+        return;
+      }
+
+      authSession = { uid: uid, username: String(staff.username || userRaw).toLowerCase(), role: staff.role };
+      state.role = staff.role;
+      state.currentUsername = authSession.username;
+      state.users = [normalizeStaffDoc(uid, staff)];
+
+      await loadAccessConfig(fb.db, staff.role, authSession.username);
+
+      recordLoginActivity(authSession.username, staff.role, true);
+      const nowIso = new Date().toISOString();
+      fb.db.collection('staff').doc(uid).update({ lastLogin: nowIso }).catch(() => {});
+      fb.db.collection('login_log').add({ uid: uid, username: authSession.username, role: staff.role, time: nowIso, success: true }).catch(() => {});
+
+      startSessionListeners(fb.db, uid, staff.role);
+      initCloudSync(); // shared business data syncs only after a real login
+      startAutoLogoutWatch();
       document.getElementById('login-overlay').style.display = 'none';
+      document.getElementById('login-password').value = '';
 
       // ADDITIVE: Sales Reps get a separate, simple mobile order-taking
-      // screen instead of the full Admin/Employee ERP interface. This is
-      // the only new branch here — the Admin/Employee login flow below is
-      // completely unchanged.
+      // screen instead of the full Admin/Employee ERP interface.
       if (state.role === 'SalesRep') {
         document.getElementById('main-app').style.display = 'none';
         document.getElementById('salesrep-app').style.display = 'flex';
@@ -3178,10 +3436,101 @@
       applyRolePermissions();
       renderAllViews();
       initCharts();
-    } else {
-      if (user) recordLoginActivity(user, matchedUser ? matchedUser.role : null, false); // NEW: log failed attempts (wrong password, or deactivated account) for the Security activity log
-      errDiv.style.display = 'block';
+    } finally {
+      loginBusy = false;
+      if (submitBtn) submitBtn.disabled = false;
     }
+  }
+
+  // Admin's Security panel: successful logins from every device (Firestore)
+  // plus the failed attempts made on this device.
+  function getMergedLoginActivity() {
+    const local = (state.loginActivity || []).filter(a => a && a.success === false);
+    const cloud = (cloudLoginLog || []).filter(Boolean);
+    return cloud.concat(local).sort((a, b) => new Date(b.time) - new Date(a.time));
+  }
+
+  function secureLogoutCleanup() {
+    const run = async () => {
+      try {
+        if (authSession && cloudSyncReady && cloudDocRef) {
+          await Promise.race([pushStateToCloudImmediate(), new Promise(r => setTimeout(r, 5000))]);
+        }
+      } catch (e) {}
+      stopSessionListeners();
+      if (typeof cloudDocUnsub === 'function') { try { cloudDocUnsub(); } catch (e) {} }
+      cloudDocUnsub = null;
+      cloudListenerAttached = false;
+      cloudSyncReady = false;
+      cloudDocRef = null;
+      clearTimeout(cloudSaveTimer);
+      clearTimeout(cloudReconnectTimer);
+      try { if (typeof firebase !== 'undefined' && firebase.apps.length) await firebase.auth().signOut(); } catch (e) {}
+      authSession = null;
+      state.users = [];
+      cloudLoginLog = [];
+      accessConfigLoaded = false;
+      adminReauthAt = 0;
+    };
+    return run();
+  }
+
+  // Creates a Firebase Authentication user WITHOUT signing the Admin out
+  // (uses a second, temporary Firebase app instance).
+  async function createAuthAccount(email, password) {
+    let app = firebase.apps.find(a => a.name === 'erp-staff-creator');
+    if (!app) app = firebase.initializeApp(CLOUD_SYNC_CONFIG, 'erp-staff-creator');
+    const a = app.auth();
+    try { await a.setPersistence(firebase.auth.Auth.Persistence.NONE); } catch (x) {}
+    try {
+      const cred = await a.createUserWithEmailAndPassword(email, password);
+      return cred.user.uid;
+    } finally {
+      try { await a.signOut(); } catch (x) {}
+    }
+  }
+
+  // ---- Admin password confirmation before sensitive changes ------------
+  function requireAdminReauth() {
+    if (!authSession || authSession.role !== 'Admin') return Promise.resolve(false);
+    if (Date.now() - adminReauthAt < 5 * 60 * 1000) return Promise.resolve(true);
+    return new Promise(resolve => {
+      if (reauthResolver) { reauthResolver(false); reauthResolver = null; }
+      reauthResolver = resolve;
+      const pw = document.getElementById('reauth-password');
+      const er = document.getElementById('reauth-error');
+      if (pw) pw.value = '';
+      if (er) er.style.display = 'none';
+      document.getElementById('reauth-modal').style.display = 'flex';
+      if (pw) setTimeout(() => { try { pw.focus(); } catch (x) {} }, 50);
+    });
+  }
+
+  async function submitReauth(e) {
+    e.preventDefault();
+    const pw = document.getElementById('reauth-password');
+    const er = document.getElementById('reauth-error');
+    try {
+      const user = firebase.auth().currentUser;
+      if (!user) throw new Error('Not signed in.');
+      const cred = firebase.auth.EmailAuthProvider.credential(user.email, pw.value);
+      await user.reauthenticateWithCredential(cred);
+      adminReauthAt = Date.now();
+      pw.value = '';
+      document.getElementById('reauth-modal').style.display = 'none';
+      if (reauthResolver) { const r = reauthResolver; reauthResolver = null; r(true); }
+    } catch (err) {
+      er.textContent = (err && err.code === 'auth/too-many-requests') ? 'Too many attempts — try again later.'
+        : ((err && err.code === 'auth/network-request-failed') ? 'No internet connection.' : 'Incorrect password.');
+      er.style.display = 'block';
+    }
+  }
+
+  function cancelReauth() {
+    document.getElementById('reauth-modal').style.display = 'none';
+    const pw = document.getElementById('reauth-password');
+    if (pw) pw.value = '';
+    if (reauthResolver) { const r = reauthResolver; reauthResolver = null; r(false); }
   }
 
   // NEW: appends one entry to the Security panel's login activity log and
@@ -3222,6 +3571,7 @@
 
   function logout() {
     stopAutoLogoutWatch(); // NEW
+    pendingLogoutPromise = secureLogoutCleanup().catch(() => {}).then(() => { pendingLogoutPromise = null; }); // NEW: sign out of Firebase, stop sync
     document.getElementById('main-app').style.display = 'none';
     if (document.getElementById('salesrep-app')) document.getElementById('salesrep-app').style.display = 'none'; // ADDITIVE
     document.getElementById('login-overlay').style.display = 'flex';
@@ -3291,7 +3641,7 @@
     const roleIcon = { Admin: 'fa-user-shield', Employee: 'fa-user', SalesRep: 'fa-route' };
     usersTbody.innerHTML = (state.users || []).map(u => `
       <tr>
-        <td style="font-weight:600;">${u.username}</td>
+        <td style="font-weight:600;">${uPermEsc(u.username)}</td>
         <td><span class="role-badge"><i class="fa-solid ${roleIcon[u.role] || 'fa-user'}"></i> ${u.role}</span></td>
         <td>${u.active !== false
           ? '<span style="color:var(--success); font-weight:600;">● Active</span>'
@@ -3299,6 +3649,7 @@
         <td style="color:var(--text-muted); font-size:0.8rem;">${u.lastLogin ? new Date(u.lastLogin).toLocaleString() : 'Never'}</td>
         <td>
           <button class="btn-action btn-secondary" style="padding:4px 8px;" onclick="openEditUserModal('${u.username.replace(/'/g, "\\'")}')" title="Edit"><i class="fa-solid fa-pen"></i></button>
+          ${String(u.username).indexOf('@') >= 0 ? `<button class="btn-action btn-secondary" style="padding:4px 8px;" onclick="sendStaffPasswordReset('${String(u.username).replace(/'/g, "\\'")}')" title="Send password-reset e-mail"><i class="fa-solid fa-envelope"></i></button>` : ''}
           <button class="btn-action btn-danger" style="padding:4px 8px;" onclick="deleteUserAccount('${u.username.replace(/'/g, "\\'")}')" title="Delete"><i class="fa-solid fa-trash"></i></button>
         </td>
       </tr>`).join('') || '<tr><td colspan="5" style="text-align:center; color:var(--text-muted);">No user accounts.</td></tr>';
@@ -3320,10 +3671,10 @@
 
     let activityTbody = document.getElementById('settings-login-activity-table');
     if (activityTbody) {
-      activityTbody.innerHTML = (state.loginActivity || []).slice(0, 20).map(a => `
+      activityTbody.innerHTML = getMergedLoginActivity().slice(0, 20).map(a => `
         <tr>
-          <td>${a.username}</td>
-          <td>${a.role || '-'}</td>
+          <td>${uPermEsc(a.username)}</td>
+          <td>${uPermEsc(a.role || '-')}</td>
           <td style="font-size:0.8rem; color:var(--text-muted);">${new Date(a.time).toLocaleString()}</td>
           <td>${a.success
             ? '<span style="color:var(--success); font-weight:600;">✔ Success</span>'
@@ -3338,6 +3689,8 @@
     document.getElementById('ua-username').value = '';
     document.getElementById('ua-username').disabled = false;
     document.getElementById('ua-password').value = '';
+    document.getElementById('ua-password').disabled = false;
+    document.getElementById('ua-password').placeholder = 'Login password (min 6 characters)';
     document.getElementById('ua-role').value = 'Employee';
     document.getElementById('ua-active').checked = true;
     document.getElementById('user-account-modal').style.display = 'flex';
@@ -3350,7 +3703,10 @@
     document.getElementById('ua-original-username').value = u.username;
     document.getElementById('ua-username').value = u.username;
     document.getElementById('ua-username').disabled = true; // keep username stable for an existing account
-    document.getElementById('ua-password').value = u.password;
+    // Passwords are held only by Firebase — they cannot be viewed or set here.
+    document.getElementById('ua-password').value = '';
+    document.getElementById('ua-password').disabled = true;
+    document.getElementById('ua-password').placeholder = 'Managed by the user (Settings > Security > Change Password)';
     document.getElementById('ua-role').value = u.role;
     document.getElementById('ua-active').checked = u.active !== false;
     document.getElementById('user-account-modal').style.display = 'flex';
@@ -3360,59 +3716,98 @@
     document.getElementById('user-account-modal').style.display = 'none';
   }
 
-  function saveUserAccount(e) {
+  let userAccountBusy = false;
+  async function saveUserAccount(e) {
     e.preventDefault();
+    if (userAccountBusy) return;
     let originalUsername = document.getElementById('ua-original-username').value;
-    let username = document.getElementById('ua-username').value.trim();
+    let username = document.getElementById('ua-username').value.trim().toLowerCase();
     let password = document.getElementById('ua-password').value;
     let role = document.getElementById('ua-role').value;
     let active = document.getElementById('ua-active').checked;
-    let minLen = (state.security && state.security.minPasswordLength) || 4;
-
-    if (!username) { alert('Username is required.'); return; }
-    if (password.length < minLen) { alert(`Password must be at least ${minLen} characters.`); return; }
-
+    let minLen = Math.max(6, (state.security && state.security.minPasswordLength) || 6);
     let isEdit = !!originalUsername;
-    let dupe = (state.users || []).some(u => u.username.toLowerCase() === username.toLowerCase() && u.username !== originalUsername);
+
+    if (!authSession || authSession.role !== 'Admin') { alert('Only an Admin can manage user accounts.'); return; }
+    if (['Admin', 'Employee', 'SalesRep'].indexOf(role) < 0) { alert('Invalid role.'); return; }
+    if (!isValidLoginName(username)) { alert('Username must be 3-30 characters (letters, numbers, . _ -) or a valid e-mail address.'); return; }
+    if (!isEdit && password.length < minLen) { alert(`Password must be at least ${minLen} characters.`); return; }
+
+    let dupe = (state.users || []).some(u => u.username.toLowerCase() === username && u.username !== originalUsername);
     if (dupe) { alert('That username is already in use.'); return; }
 
+    let target = null;
     if (isEdit) {
-      let u = state.users.find(x => x.username === originalUsername);
-      if (!u) return;
+      target = (state.users || []).find(x => x.username === originalUsername);
+      if (!target || !target.uid) { alert('Account not found. Please refresh and try again.'); return; }
       // Safety: don't let the very last active Admin account be deactivated
       // or demoted — that would lock everyone out of Admin access.
       let otherActiveAdmins = state.users.filter(x => x.username !== originalUsername && x.role === 'Admin' && x.active !== false).length;
-      if (u.role === 'Admin' && otherActiveAdmins === 0 && (role !== 'Admin' || !active)) {
+      if (target.role === 'Admin' && otherActiveAdmins === 0 && (role !== 'Admin' || !active)) {
         alert('At least one active Admin account must remain.');
         return;
       }
-      u.password = password;
-      u.role = role;
-      u.active = active;
-      if (state.currentUsername === originalUsername) state.currentUsername = username; // keep in sync if renamed via username field being re-enabled elsewhere
-    } else {
-      state.users.push({ username, password, role, active, lastLogin: null });
     }
 
-    closeUserAccountModal();
-    saveState();
+    if (!(await requireAdminReauth())) return;
+    userAccountBusy = true;
+    const saveBtn = document.querySelector('#user-account-modal button[type="submit"]');
+    if (saveBtn) saveBtn.disabled = true;
+    try {
+      if (isEdit) {
+        await cloudDb.collection('staff').doc(target.uid).update({ role: role, active: active });
+      } else {
+        const uid = await createAuthAccount(toLoginEmail(username), password);
+        await cloudDb.collection('staff').doc(uid).set({
+          username: username, role: role, active: active, lastLogin: null,
+          createdAt: new Date().toISOString(), createdBy: authSession.username
+        });
+      }
+      closeUserAccountModal();
+    } catch (err) {
+      alert(friendlyFirebaseError(err));
+    } finally {
+      userAccountBusy = false;
+      if (saveBtn) saveBtn.disabled = false;
+    }
   }
 
-  function deleteUserAccount(username) {
+  async function deleteUserAccount(username) {
     let u = (state.users || []).find(x => x.username === username);
     if (!u) return;
+    if (!authSession || authSession.role !== 'Admin') { alert('Only an Admin can manage user accounts.'); return; }
     let otherActiveAdmins = state.users.filter(x => x.username !== username && x.role === 'Admin' && x.active !== false).length;
     if (u.role === 'Admin' && otherActiveAdmins === 0) {
       alert('At least one active Admin account must remain — deactivate or delete a different Admin account first, or add a new one.');
       return;
     }
-    if (state.currentUsername === username) {
+    if (state.currentUsername === username || (authSession && authSession.uid === u.uid)) {
       alert("You can't delete the account you're currently logged in as. Log in as a different Admin first.");
       return;
     }
-    if (!confirm(`Delete the login account "${username}"? This cannot be undone.`)) return;
-    state.users = state.users.filter(x => x.username !== username);
-    saveState();
+    if (!confirm(`Delete the login account "${username}"? This person will lose all access immediately.`)) return;
+    if (!(await requireAdminReauth())) return;
+    try {
+      await cloudDb.collection('staff').doc(u.uid).delete();
+      alert(`Access removed for "${username}". To reuse this username later, also delete it in Firebase Console > Authentication > Users.`);
+    } catch (err) {
+      alert(friendlyFirebaseError(err));
+    }
+  }
+
+  async function sendStaffPasswordReset(username) {
+    if (!username || username.indexOf('@') < 0) {
+      alert('Password-reset e-mails only work when the username is a real e-mail address.');
+      return;
+    }
+    if (!confirm(`Send a password-reset e-mail to ${username}?`)) return;
+    if (!(await requireAdminReauth())) return;
+    try {
+      await firebase.auth().sendPasswordResetEmail(username);
+      alert('Password-reset e-mail sent to ' + username);
+    } catch (err) {
+      alert(friendlyFirebaseError(err));
+    }
   }
 
   function savePermissions() {
@@ -3424,24 +3819,33 @@
     alert('Permissions saved.');
   }
 
-  function changeOwnPassword(e) {
+  async function changeOwnPassword(e) {
     e.preventDefault();
     let current = document.getElementById('sec-current-pass').value;
     let next = document.getElementById('sec-new-pass').value;
     let confirmPass = document.getElementById('sec-confirm-pass').value;
-    let minLen = (state.security && state.security.minPasswordLength) || 4;
+    let minLen = Math.max(6, (state.security && state.security.minPasswordLength) || 6);
 
-    let me = (state.users || []).find(u => u.username === state.currentUsername);
-    if (!me) { alert('Could not identify the currently logged-in account.'); return; }
-    if (me.password !== current) { alert('Current password is incorrect.'); return; }
+    const user = (typeof firebase !== 'undefined' && firebase.apps.length) ? firebase.auth().currentUser : null;
+    if (!user || !authSession) { alert('Could not identify the currently logged-in account. Please log in again.'); return; }
+    if (!current) { alert('Please enter your current password.'); return; }
     if (next.length < minLen) { alert(`New password must be at least ${minLen} characters.`); return; }
     if (next !== confirmPass) { alert('New password and confirmation do not match.'); return; }
+    if (next === current) { alert('The new password must be different from the current one.'); return; }
 
-    me.password = next;
+    try {
+      const cred = firebase.auth.EmailAuthProvider.credential(user.email, current);
+      await user.reauthenticateWithCredential(cred);
+      await user.updatePassword(next);
+    } catch (err) {
+      const c = (err && err.code) || '';
+      if (c === 'auth/wrong-password' || c === 'auth/invalid-credential' || c === 'auth/invalid-login-credentials') alert('Current password is incorrect.');
+      else alert(friendlyFirebaseError(err));
+      return;
+    }
     document.getElementById('sec-current-pass').value = '';
     document.getElementById('sec-new-pass').value = '';
     document.getElementById('sec-confirm-pass').value = '';
-    saveState();
     alert('Password updated.');
   }
 
@@ -3556,10 +3960,10 @@
     // Settings without touching code. Seeded with the exact same two
     // accounts USER_CREDENTIALS always had, so nothing about existing
     // logins changes by default.
-    users: [
-      { username: 'admin', password: 'anupa@123', role: 'Admin', active: true, lastLogin: null },
-      { username: 'salesrep', password: 'rep@123', role: 'SalesRep', active: true, lastLogin: null }
-    ],
+    // SECURITY: no accounts or passwords are stored here any more. The staff
+    // list is loaded from Firestore (staff/{uid}) after login; passwords
+    // exist only inside Firebase Authentication.
+    users: [],
     // employeeExtraTabs: admin-only tabs Admin has additionally granted to
     // the Employee role. Empty by default = current behavior unchanged.
     rolePermissions: { employeeExtraTabs: [], employeeActions: {} },
@@ -3640,14 +4044,13 @@
 
   function initCloudSync() {
     if (!cloudSyncConfigured) return; // stays fully local/offline until configured
+    if (!authSession) return; // SECURITY: cloud data is only used after a successful login
     if (typeof firebase === 'undefined') { setCloudStatus('Cloud Sync: library failed to load', 'error'); scheduleCloudReconnect(); return; }
 
     try {
       if (!firebase.apps.length) firebase.initializeApp(CLOUD_SYNC_CONFIG);
       cloudDb = firebase.firestore();
       setCloudStatus('Cloud Sync: connecting…');
-
-      firebase.auth().signInAnonymously().catch(() => { /* auth optional depending on your Firestore rules */ });
 
       cloudDocRef = cloudDb.collection(CLOUD_DOC_PATH.collection).doc(CLOUD_DOC_PATH.doc);
 
@@ -3677,7 +4080,7 @@
       // NEW: guarded so a reconnect retry never registers a second duplicate listener.
       if (!cloudListenerAttached) {
         cloudListenerAttached = true;
-        cloudDocRef.onSnapshot({ includeMetadataChanges: true }, snap => {
+        cloudDocUnsub = cloudDocRef.onSnapshot({ includeMetadataChanges: true }, snap => {
           if (!snap.exists) return;
           if (snap.metadata.hasPendingWrites) return; // this is our own write echoing back — ignore
           applyRemoteState(snap.data());
@@ -3728,8 +4131,14 @@
     // selected items/price/quantity. Everything else (products, sales,
     // customers, etc.) still syncs normally as before.
     let localCart = Array.isArray(state.cart) ? state.cart : [];
+    // SECURITY: users/permissions/security/role belong to this session and to
+    // the Firestore staff/config documents — a remote copy must never replace
+    // them (previously another device's role could overwrite this one's).
+    const keepLocal = captureLocalOnlyFields();
+    const legacyCleanup = LOCAL_ONLY_STATE_KEYS.some(k => Object.prototype.hasOwnProperty.call(remoteData || {}, k));
     state = remoteData;
     state.cart = localCart;
+    restoreLocalOnlyFields(keepLocal);
     // BUGFIX: run the same safety/migration checks used on local load, so
     // remote data saved before a newer field existed (e.g. packingRecipes,
     // packingMaterials, expirySettings, a product's batches array) doesn't
@@ -3743,6 +4152,9 @@
       updateCharts();
     }
     cloudApplyingRemote = false;
+    // One-time clean-up: an older version stored user accounts/passwords in
+    // the shared document. The first Admin to log in removes them from the cloud.
+    if (legacyCleanup && authSession && authSession.role === 'Admin') pushStateToCloud();
   }
 
   // BUGFIX HELPER: returns a copy of state for cloud sync with the
@@ -3752,7 +4164,28 @@
   function getSyncableState() {
     let copy = Object.assign({}, state);
     delete copy.cart;
+    LOCAL_ONLY_STATE_KEYS.forEach(k => { delete copy[k]; }); // SECURITY: never sync accounts/permissions/role into business data
     return copy;
+  }
+
+  // SECURITY: one place that decides HOW this login writes to the cloud.
+  // Admin/Employee save the shared document as before. A Sales Rep's login is
+  // only allowed (by the Firestore rules) to add field orders, so it merges
+  // just state.repOrders — without touching or overwriting anything else.
+  function cloudWriteState() {
+    if (authSession && authSession.role === 'SalesRep') return pushRepOrdersToCloud();
+    return cloudDocRef.set(getSyncableState());
+  }
+
+  function pushRepOrdersToCloud() {
+    return cloudDb.runTransaction(async tx => {
+      const snap = await tx.get(cloudDocRef);
+      const cloudOrders = (snap.exists && Array.isArray(snap.data().repOrders)) ? snap.data().repOrders : [];
+      const ids = new Set(cloudOrders.map(o => o && o.id));
+      const mine = (state.repOrders || []).filter(o => o && o.id && !ids.has(o.id));
+      if (mine.length === 0) return;
+      if (snap.exists) tx.update(cloudDocRef, { repOrders: cloudOrders.concat(mine) });
+    });
   }
 
   function pushStateToCloud() {
@@ -3767,7 +4200,7 @@
     // Debounce so rapid local edits (typing, etc.) don't spam Firestore.
     clearTimeout(cloudSaveTimer);
     cloudSaveTimer = setTimeout(() => {
-      cloudDocRef.set(getSyncableState()).catch(() => {
+      cloudWriteState().catch(() => {
         setCloudStatus('Cloud Sync: save failed (retrying)', 'error');
         // NEW: automatically retry this save shortly instead of silently
         // dropping it — a Sales Rep out on route has no way to notice or
@@ -3795,7 +4228,7 @@
       return Promise.resolve();
     }
     clearTimeout(cloudSaveTimer); // supersede any pending debounced save with this immediate one
-    return cloudDocRef.set(getSyncableState()).catch(() => {
+    return cloudWriteState().catch(() => {
       setCloudStatus('Cloud Sync: save failed (retrying)', 'error');
       cloudPendingPush = true;
       setTimeout(flushPendingCloudPush, 8000);
@@ -3805,6 +4238,7 @@
   // Initialize System
   window.onload = function() {
     loadStateFromStorage();
+    try { localStorage.setItem('FACTORY_ERP_STATE', JSON.stringify(state)); } catch (e) {} // SECURITY: immediately drop any old saved passwords from this browser
     setDefaultPOSDate();
     generateAutoBillNumber();
     initCloudSync(); // NEW: connects to Firebase if Cloud Sync has been configured
@@ -3852,6 +4286,7 @@
       updateCharts();
     }
     pushStateToCloud(); // NEW: also sync to other devices, if Cloud Sync is configured
+    pushAccessConfigIfChanged(); // NEW: Admin's Roles & Permissions / Security changes go to config/access
   }
 
   function saveStateSilently() {
@@ -3917,12 +4352,12 @@
     // user account was somehow saved without a role, default it to
     // 'Employee' (the least-privileged option) rather than leaving it
     // blank.
-    if (!Array.isArray(state.users) || state.users.length === 0) {
-      state.users = [
-        { username: 'admin', password: 'anupa@123', role: 'Admin', active: true, lastLogin: null },
-        { username: 'salesrep', password: 'rep@123', role: 'SalesRep', active: true, lastLogin: null }
-      ];
-    }
+    // SECURITY: never keep passwords (older saved data may still contain
+    // them) and never seed default accounts. Only accounts that came from
+    // Firestore (they carry a uid) are kept.
+    if (!Array.isArray(state.users)) state.users = [];
+    state.users = state.users.filter(u => u && typeof u === 'object' && u.uid && u.username);
+    state.users.forEach(u => { delete u.password; });
     state.users.forEach(u => { if (!u.role) u.role = 'Employee'; if (typeof u.active !== 'boolean') u.active = true; });
     if (!state.rolePermissions || typeof state.rolePermissions !== 'object') state.rolePermissions = { employeeExtraTabs: [] };
     if (!Array.isArray(state.rolePermissions.employeeExtraTabs)) state.rolePermissions.employeeExtraTabs = [];
@@ -4238,7 +4673,9 @@
           return;
         }
 
+        const keepLocalFields = captureLocalOnlyFields(); // SECURITY: a backup file must not replace accounts/role
         state = importedState;
+        restoreLocalOnlyFields(keepLocalFields);
         // BUGFIX: restoring a backup used to skip the same safety/migration
         // checks that run on normal page load (giving every finished good a
         // stable productId, ensuring packingRecipes/packingMaterials/
@@ -4290,7 +4727,9 @@
       (state.salesReps || []).forEach(r => { r.totalSales = 0.00; r.totalCommission = 0.00; });
       state.customerReturns = [];
     } else {
+      const keepLocalFields = captureLocalOnlyFields(); // SECURITY: keep this session's accounts/permissions/role
       state = JSON.parse(JSON.stringify(defaultState));
+      restoreLocalOnlyFields(keepLocalFields);
       state.sales = [];
       state.expenses = [];
       state.stockAdjustments = [];
@@ -12411,25 +12850,53 @@ function settleCreditBillWithReturn(invoiceId){
     renderUserPermissionsPanel();
   }
 
-  function saveUserPermissions() {
+  async function saveUserPermissions() {
     const d = uPermDraft;
     if (!d) return;
     const u = (state.users || []).find(x => x.username === d.username);
-    if (!u) { alert('That account no longer exists.'); return; }
+    if (!u || !u.uid) { alert('That account no longer exists.'); return; }
     if (u.role !== 'Employee') { alert('Custom permissions can only be set for Employee accounts.'); return; }
+    if (!authSession || authSession.role !== 'Admin') { alert('Only an Admin can change permissions.'); return; }
     if (d.custom) {
       const anyPage = d.tabs.length > 0 || Object.keys(PERM_DEFS).some(k => k.indexOf('tab:') === 0 && d.actions[k]);
       if (!anyPage && !confirm('No page is allowed for this login, so "' + d.username + '" will not be able to use the system. Save anyway?')) return;
-      u.permissions = { custom: true, extraTabs: d.tabs.slice(), actions: Object.assign({}, d.actions) };
-    } else {
-      delete u.permissions;
+    }
+    if (!(await requireAdminReauth())) return;
+    try {
+      if (d.custom) {
+        await cloudDb.collection('staff').doc(u.uid).update({
+          permissions: { custom: true, extraTabs: d.tabs.slice(), actions: Object.assign({}, d.actions) }
+        });
+      } else {
+        await cloudDb.collection('staff').doc(u.uid).update({ permissions: firebase.firestore.FieldValue.delete() });
+      }
+    } catch (err) {
+      alert(friendlyFirebaseError(err));
+      return;
     }
     uPermDraft = null;
-    saveState();
+    renderUserPermissionsPanel();
     alert(d.custom
-      ? 'Custom permissions saved for "' + d.username + '". They apply the next time this person logs in.'
+      ? 'Custom permissions saved for "' + d.username + '". They apply immediately.'
       : '"' + d.username + '" now follows the Roles & Permissions settings.');
   }
+
+  // SECURITY: changing role-wide permissions or security settings needs the
+  // Admin's password again (protects against a hijacked/unattended session).
+  (function guardSensitiveSettingsActions() {
+    const origSavePerms = window.savePermissions;
+    if (typeof origSavePerms === 'function' && !origSavePerms.__reauth) {
+      const w = function () { const self = this, args = arguments; requireAdminReauth().then(ok => { if (ok) origSavePerms.apply(self, args); }); };
+      w.__reauth = true;
+      window.savePermissions = w;
+    }
+    const origSaveSec = window.saveSecuritySettings;
+    if (typeof origSaveSec === 'function' && !origSaveSec.__reauth) {
+      const w2 = function (ev) { if (ev && ev.preventDefault) ev.preventDefault(); const self = this; requireAdminReauth().then(ok => { if (ok) origSaveSec.call(self, ev); }); };
+      w2.__reauth = true;
+      window.saveSecuritySettings = w2;
+    }
+  })();
 
   (function initUserPermissionsPanel() {
     const prevRenderSettings = window.renderSettings;
